@@ -1,0 +1,1328 @@
+api route:
+import { NextRequest, NextResponse } from "next/server"
+
+const BACKEND_DETECT_URL =
+  process.env.HARGAI_DETECT_URL ||
+  (process.env.BACKEND_BASE_URL
+    ? `${process.env.BACKEND_BASE_URL}/detect`
+    : "https://hargai.site/detect")
+
+export async function POST(req: NextRequest) {
+  try {
+    const auth = req.headers.get("authorization")
+    const incomingUrl = new URL(req.url)
+    const preview = incomingUrl.searchParams.get("preview")
+
+    const incoming = await req.formData()
+    const file = incoming.get("file")
+
+    if (!(file instanceof File)) {
+      return NextResponse.json(
+        { message: "File tidak ditemukan." },
+        { status: 400 }
+      )
+    }
+
+    const extFromType =
+      file.type === "image/png"
+        ? "png"
+        : file.type === "image/jpeg" || file.type === "image/jpg"
+          ? "jpg"
+          : "jpg"
+
+    const originalName = file.name || ""
+    const hasValidExtension = /\.(jpg|jpeg|png)$/i.test(originalName)
+
+    const safeFileName = hasValidExtension
+      ? originalName
+      : `upload-${Date.now()}.${extFromType}`
+
+    const formData = new FormData()
+    formData.append("file", file, safeFileName)
+
+    const targetUrl = new URL(BACKEND_DETECT_URL)
+
+    if (preview) {
+      targetUrl.searchParams.set("preview", preview)
+    }
+
+    const headers: HeadersInit = {}
+    if (auth) {
+      headers.Authorization = auth
+    }
+
+    const response = await fetch(targetUrl.toString(), {
+      method: "POST",
+      headers,
+      body: formData,
+    })
+
+    const text = await response.text()
+    const contentType = response.headers.get("content-type") || "application/json"
+
+    if (!response.ok) {
+      let backendError: any = null
+
+      try {
+        backendError = JSON.parse(text)
+      } catch {
+        backendError = null
+      }
+
+      return NextResponse.json(
+        {
+          message:
+            backendError?.message ||
+            backendError?.detail ||
+            "Request ke backend tidak valid.",
+          detail: backendError?.detail || text,
+          backend_status: response.status,
+        },
+        { status: response.status }
+      )
+    }
+
+    return new NextResponse(text, {
+      status: response.status,
+      headers: {
+        "Content-Type": contentType,
+      },
+    })
+  } catch (error: any) {
+    return NextResponse.json(
+      {
+        message: "Backend deteksi tidak dapat dijangkau.",
+        detail: error?.message || "Unknown error",
+      },
+      { status: 503 }
+    )
+  }
+}
+
+page detect:
+
+"use client"
+
+import Navigation from "@/components/navigation"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Badge } from "@/components/ui/badge"
+import {
+  Camera,
+  Upload,
+  AlertCircle,
+  RefreshCw,
+  X,
+  Circle,
+  Tag,
+  Loader2,
+  CheckCircle,
+  ArrowRight,
+} from "lucide-react"
+import { useEffect, useMemo, useRef, useState } from "react"
+import Link from "next/link"
+import { useRouter } from "next/navigation"
+import { api } from "@/lib/api"
+
+type WastePrice = {
+  id: string
+  name: string
+  category: string
+  unit: string
+  current_price: number | string | null
+  currency: string
+}
+
+type BackendDetection = {
+  label: string
+  confidence: number
+  bbox: {
+    x1: number
+    y1: number
+    x2: number
+    y2: number
+  }
+  price?: WastePrice | null
+}
+
+type DetectWasteResponse = {
+  audit_id: number | string
+  image_url: string
+  preview_image?: string
+  detections: BackendDetection[]
+  top_prediction: string
+  created_at: string
+  raw_response?: unknown
+}
+
+const normalizeLabel = (value: string) => {
+  return value.trim().toLowerCase().replace(/[_-]/g, " ")
+}
+
+const formatCurrency = (
+  value: number | string | null | undefined,
+  currency = "IDR"
+) => {
+  const numberValue = Number(value)
+
+  if (value === null || value === undefined || Number.isNaN(numberValue)) {
+    return "Harga belum tersedia"
+  }
+
+  return new Intl.NumberFormat("id-ID", {
+    style: "currency",
+    currency,
+    maximumFractionDigits: 0,
+  }).format(numberValue)
+}
+
+const findWastePrice = (label: string, wasteTypes: WastePrice[]) => {
+  const target = normalizeLabel(label)
+
+  return (
+    wasteTypes.find((item) => normalizeLabel(item.name) === target) ||
+    wasteTypes.find((item) => target.includes(normalizeLabel(item.name))) ||
+    wasteTypes.find((item) => normalizeLabel(item.name).includes(target)) ||
+    null
+  )
+}
+
+const normalizeConfidence = (value: unknown): number => {
+  const numberValue = Number(value)
+  if (Number.isNaN(numberValue)) return 0
+  if (numberValue > 1) return numberValue / 100
+  return numberValue
+}
+
+const normalizeBBox = (item: any) => {
+  const bbox =
+    item?.bbox ||
+    item?.box ||
+    item?.bounding_box ||
+    item?.boundingBox ||
+    {}
+
+  return {
+    x1: Number(bbox?.x1 ?? bbox?.xmin ?? bbox?.left ?? item?.x1 ?? item?.xmin ?? 0),
+    y1: Number(bbox?.y1 ?? bbox?.ymin ?? bbox?.top ?? item?.y1 ?? item?.ymin ?? 0),
+    x2: Number(bbox?.x2 ?? bbox?.xmax ?? bbox?.right ?? item?.x2 ?? item?.xmax ?? 0),
+    y2: Number(bbox?.y2 ?? bbox?.ymax ?? bbox?.bottom ?? item?.y2 ?? item?.ymax ?? 0),
+  }
+}
+
+const getRawDetections = (result: any): any[] => {
+  if (!result) return []
+
+  const possibleArrays = [
+    result.detections,
+    result.results,
+    result.predictions,
+    result.objects,
+    result.items,
+    result.data?.detections,
+    result.data?.results,
+    result.data?.predictions,
+    result.output?.detections,
+    result.output?.results,
+    result.output?.predictions,
+  ]
+
+  const foundArray = possibleArrays.find((value) => Array.isArray(value))
+  return Array.isArray(foundArray) ? foundArray : []
+}
+
+const getLabelFromItem = (item: any, index: number): string => {
+  return String(
+    item?.label ??
+      item?.class ??
+      item?.class_name ??
+      item?.className ??
+      item?.name ??
+      item?.category ??
+      item?.prediction ??
+      item?.predicted_class ??
+      item?.predicted_label ??
+      item?.cls ??
+      item?.object ??
+      item?.type ??
+      `Objek ${index + 1}`
+  )
+}
+
+const getConfidenceFromItem = (item: any): number => {
+  return normalizeConfidence(
+    item?.confidence ??
+      item?.score ??
+      item?.conf ??
+      item?.probability ??
+      item?.prob ??
+      item?.accuracy ??
+      0
+  )
+}
+
+const getDetections = (
+  result: any,
+  wasteTypes: WastePrice[] = []
+): BackendDetection[] => {
+  if (!result) return []
+
+  const rawDetections = getRawDetections(result)
+
+  if (rawDetections.length > 0) {
+    return rawDetections.map((item: any, index: number) => {
+      const label = getLabelFromItem(item, index)
+
+      return {
+        label,
+        confidence: getConfidenceFromItem(item),
+        bbox: normalizeBBox(item),
+        price: findWastePrice(label, wasteTypes),
+      }
+    })
+  }
+
+  const singleLabel =
+    result.top_prediction ??
+    result.top_label ??
+    result.prediction ??
+    result.label ??
+    result.class ??
+    result.class_name ??
+    result.predicted_class ??
+    result.predicted_label ??
+    result.result ??
+    result.category ??
+    result.data?.top_prediction ??
+    result.data?.top_label ??
+    result.data?.prediction ??
+    result.data?.label ??
+    result.output?.top_prediction ??
+    result.output?.top_label ??
+    result.output?.prediction ??
+    result.output?.label
+
+  if (!singleLabel) return []
+
+  const label = String(singleLabel)
+
+  return [
+    {
+      label,
+      confidence: normalizeConfidence(
+        result.confidence ??
+          result.score ??
+          result.conf ??
+          result.probability ??
+          result.data?.confidence ??
+          result.data?.score ??
+          result.output?.confidence ??
+          result.output?.score ??
+          0
+      ),
+      bbox: {
+        x1: 0,
+        y1: 0,
+        x2: 0,
+        y2: 0,
+      },
+      price: findWastePrice(label, wasteTypes),
+    },
+  ]
+}
+
+const getTopPrediction = (result: any, wasteTypes: WastePrice[] = []): string => {
+  if (!result) return "Tidak diketahui"
+
+  const detections = getDetections(result, wasteTypes)
+
+  return String(
+    result.top_prediction ??
+      result.top_label ??
+      result.prediction ??
+      result.label ??
+      result.class ??
+      result.class_name ??
+      result.predicted_class ??
+      result.predicted_label ??
+      result.result ??
+      result.category ??
+      result.data?.top_prediction ??
+      result.data?.top_label ??
+      result.data?.prediction ??
+      result.data?.label ??
+      result.output?.top_prediction ??
+      result.output?.top_label ??
+      result.output?.prediction ??
+      result.output?.label ??
+      detections[0]?.label ??
+      "Tidak diketahui"
+  )
+}
+
+const getImageUrl = (result: any): string => {
+  return String(
+    result?.image_url ??
+      result?.imageUrl ??
+      result?.image ??
+      result?.url ??
+      result?.file_url ??
+      result?.fileUrl ??
+      result?.data?.image_url ??
+      result?.data?.imageUrl ??
+      result?.data?.image ??
+      result?.output?.image_url ??
+      ""
+  )
+}
+
+const normalizeDetectResponse = (
+  result: any,
+  wasteTypes: WastePrice[] = []
+): DetectWasteResponse => {
+  const detections = getDetections(result, wasteTypes)
+  const topPrediction = getTopPrediction(result, wasteTypes)
+
+  return {
+    audit_id: result?.audit_id ?? result?.auditId ?? result?.id ?? `local-${Date.now()}`,
+    image_url: getImageUrl(result),
+    detections,
+    top_prediction: topPrediction,
+    created_at:
+      result?.created_at ??
+      result?.createdAt ??
+      result?.timestamp ??
+      result?.data?.created_at ??
+      new Date().toISOString(),
+    raw_response: result,
+  }
+}
+
+export default function WasteDetectionPage() {
+  const router = useRouter()
+
+  const [previewImage, setPreviewImage] = useState<string | null>(null)
+  const [detectResult, setDetectResult] = useState<DetectWasteResponse | null>(null)
+  const [wasteTypes, setWasteTypes] = useState<WastePrice[]>([])
+  const [isLoading, setIsLoading] = useState(false)
+  const [isPriceLoading, setIsPriceLoading] = useState(false)
+  const [isCameraOpen, setIsCameraOpen] = useState(false)
+  const [isLiveDetecting, setIsLiveDetecting] = useState(false)
+  const [isLiveProcessing, setIsLiveProcessing] = useState(false)
+  const [liveDetections, setLiveDetections] = useState<BackendDetection[]>([])
+  const [cameraError, setCameraError] = useState<string | null>(null)
+  const [stream, setStream] = useState<MediaStream | null>(null)
+  const [errorMessage, setErrorMessage] = useState("")
+  const [isRedirecting, setIsRedirecting] = useState(false)
+  const [imageNaturalSize, setImageNaturalSize] = useState({
+    width: 0,
+    height: 0,
+  })
+
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const liveIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const liveProcessingRef = useRef(false)
+
+  const detections = detectResult?.detections ?? []
+  const topPrediction = detectResult?.top_prediction ?? "Tidak diketahui"
+
+  const detectedPrices = useMemo(() => {
+    return detections
+      .map((item) => item.price)
+      .filter((item): item is WastePrice => Boolean(item))
+  }, [detections])
+
+  const totalEstimatedPrice = useMemo(() => {
+    return detectedPrices.reduce((total, item) => {
+      const price = Number(item.current_price)
+      return total + (Number.isNaN(price) ? 0 : price)
+    }, 0)
+  }, [detectedPrices])
+
+  useEffect(() => {
+    const fetchWasteTypes = async () => {
+      setIsPriceLoading(true)
+
+      try {
+        const { data } = await api.get("/waste-types")
+        setWasteTypes(Array.isArray(data) ? data : [])
+      } catch (error) {
+        console.error("Gagal mengambil data harga sampah:", error)
+      } finally {
+        setIsPriceLoading(false)
+      }
+    }
+
+    fetchWasteTypes()
+  }, [])
+
+  useEffect(() => {
+    if (isCameraOpen && stream && videoRef.current) {
+      videoRef.current.srcObject = stream
+      videoRef.current.play().catch(console.error)
+    }
+  }, [isCameraOpen, stream])
+
+  useEffect(() => {
+    return () => {
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop())
+      }
+
+      if (liveIntervalRef.current) {
+        clearInterval(liveIntervalRef.current)
+        liveIntervalRef.current = null
+      }
+    }
+  }, [stream])
+
+  const stopLiveDetection = () => {
+    setIsLiveDetecting(false)
+    setIsLiveProcessing(false)
+    setLiveDetections([])
+    liveProcessingRef.current = false
+
+    if (liveIntervalRef.current) {
+      clearInterval(liveIntervalRef.current)
+      liveIntervalRef.current = null
+    }
+  }
+
+  const runLiveDetection = async () => {
+    if (liveProcessingRef.current) return
+    if (!videoRef.current || !canvasRef.current) return
+
+    const video = videoRef.current
+    const canvas = canvasRef.current
+
+    if (video.videoWidth === 0 || video.videoHeight === 0) return
+
+    liveProcessingRef.current = true
+    setIsLiveProcessing(true)
+
+    try {
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+
+      const context = canvas.getContext("2d")
+      if (!context) return
+
+      context.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+      const blob = await new Promise<Blob | null>((resolve) => {
+        canvas.toBlob(resolve, "image/jpeg", 0.8)
+      })
+
+      if (!blob) return
+
+      const file = new File([blob], `live-${Date.now()}.jpg`, {
+        type: "image/jpeg",
+      })
+
+      const formData = new FormData()
+      formData.append("file", file)
+
+      // Live detection -> preview mode (TIDAK simpan ke DB)
+      const { data } = await api.post("/detect?preview=true", formData)
+      const normalizedData = normalizeDetectResponse(data, wasteTypes)
+
+      setLiveDetections(normalizedData.detections)
+    } catch (error: any) {
+      console.error("Live detection error:", error)
+
+      const status = error?.response?.status
+      if (status === 401 || status === 403) {
+        setCameraError(
+          "Live detection belum bisa berjalan tanpa login. Mohon untuk login ulang terlebih dahulu untuk menggunakan fitur."
+        )
+        stopLiveDetection()
+      }
+    } finally {
+      liveProcessingRef.current = false
+      setIsLiveProcessing(false)
+    }
+  }
+
+  const startLiveDetection = async () => {
+    if (liveIntervalRef.current) return
+
+    setErrorMessage("")
+    setDetectResult(null)
+    setPreviewImage(null)
+    setLiveDetections([])
+    setIsLiveDetecting(true)
+
+    await runLiveDetection()
+
+    liveIntervalRef.current = setInterval(() => {
+      runLiveDetection()
+    }, 1500)
+  }
+
+  const handleOpenCamera = async () => {
+    setCameraError(null)
+    setPreviewImage(null)
+    setDetectResult(null)
+    setErrorMessage("")
+    setImageNaturalSize({ width: 0, height: 0 })
+    setLiveDetections([])
+
+    try {
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "environment",
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+        audio: false,
+      })
+
+      setStream(mediaStream)
+      setIsCameraOpen(true)
+    } catch (err: any) {
+      setCameraError(err?.message || "Gagal membuka kamera.")
+    }
+  }
+
+  const handleCloseCamera = () => {
+    stopLiveDetection()
+
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop())
+      setStream(null)
+    }
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
+
+    setIsCameraOpen(false)
+  }
+
+  const redirectToAudit = (normalizedData: DetectWasteResponse) => {
+    try {
+      sessionStorage.setItem(
+        "latest_detection_result",
+        JSON.stringify(normalizedData)
+      )
+    } catch (error) {
+      console.error("Gagal menyimpan hasil ke sessionStorage:", error)
+    }
+
+    setIsRedirecting(true)
+    // small delay so user can see the success state briefly before navigating
+    setTimeout(() => {
+      router.push("/audits")
+    }, 600)
+  }
+
+  const detectWaste = async (file: File, preview: string) => {
+    setIsLoading(true)
+    setErrorMessage("")
+    setPreviewImage(preview)
+    setDetectResult(null)
+    setImageNaturalSize({ width: 0, height: 0 })
+
+    try {
+      if (file.size > 5 * 1024 * 1024) {
+        setErrorMessage("Ukuran file melebihi 5MB.")
+        return
+      }
+
+      const validTypes = ["image/jpeg", "image/jpg", "image/png"]
+
+      if (!validTypes.includes(file.type)) {
+        setErrorMessage("Format file harus JPG, JPEG, atau PNG.")
+        return
+      }
+
+      let latestWasteTypes = wasteTypes
+
+      if (latestWasteTypes.length === 0) {
+        try {
+          const { data: wasteData } = await api.get("/waste-types")
+          latestWasteTypes = Array.isArray(wasteData) ? wasteData : []
+          setWasteTypes(latestWasteTypes)
+        } catch (error) {
+          console.error("Gagal mengambil data harga sebelum deteksi:", error)
+        }
+      }
+
+      const formData = new FormData()
+      formData.append("file", file)
+
+      // Final detect -> preview=false (BACKEND AUTO-SAVE KE DB)
+      const { data } = await api.post("/detect?preview=false", formData)
+
+      const normalizedData: DetectWasteResponse = {
+        ...normalizeDetectResponse(data, latestWasteTypes),
+        preview_image: preview,
+      }
+
+      setDetectResult(normalizedData)
+
+      // Setelah berhasil deteksi -> simpan ke sessionStorage & redirect ke /audit
+      redirectToAudit(normalizedData)
+    } catch (error: any) {
+      const status = error?.response?.status
+      const errorData = error?.response?.data
+
+      let message = "Gagal mendeteksi gambar."
+
+      if (status === 413) {
+        message = "Ukuran file melebihi 5MB."
+      } else if (status === 415) {
+        message = "Format file harus JPG, JPEG, atau PNG."
+      } else if (status === 500) {
+        message = "Terjadi kesalahan pada model AI."
+      } else if (status === 401 || status === 403) {
+        message = "Endpoint deteksi masih membutuhkan login. Jadikan /detect sebagai endpoint public di backend."
+      } else if (status === 503) {
+        message = errorData?.message || errorData?.detail || "Backend deteksi sedang tidak bisa dijangkau."
+      } else if (status === 400) {
+        message = errorData?.message || errorData?.detail || "Request tidak valid."
+      } else if (!status) {
+        message = "Koneksi ke server gagal. Cek backend dan base URL."
+      }
+
+      setErrorMessage(message)
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleCapture = async () => {
+    if (!videoRef.current || !canvasRef.current) {
+      setErrorMessage("Video atau canvas reference tidak tersedia.")
+      return
+    }
+
+    const video = videoRef.current
+    const canvas = canvasRef.current
+
+    if (video.videoWidth === 0 || video.videoHeight === 0) {
+      setErrorMessage("Video belum siap. Tunggu sebentar dan coba lagi.")
+      return
+    }
+
+    try {
+      stopLiveDetection()
+
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+
+      const context = canvas.getContext("2d")
+
+      if (!context) {
+        setErrorMessage("Tidak dapat mengakses canvas context.")
+        return
+      }
+
+      context.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+      const blob = await new Promise<Blob | null>((resolve) => {
+        canvas.toBlob(resolve, "image/jpeg", 0.92)
+      })
+
+      if (!blob) {
+        setErrorMessage("Gagal mengkonversi gambar.")
+        return
+      }
+
+      const file = new File([blob], `capture-${Date.now()}.jpg`, {
+        type: "image/jpeg",
+      })
+
+      const preview = canvas.toDataURL("image/jpeg", 0.92)
+
+      handleCloseCamera()
+      await detectWaste(file, preview)
+    } catch (err: any) {
+      setErrorMessage(`Error saat capture: ${err.message}`)
+    }
+  }
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+
+    if (!file) return
+
+    const reader = new FileReader()
+
+    reader.onload = async (readerEvent) => {
+      const preview = readerEvent.target?.result as string
+      await detectWaste(file, preview)
+    }
+
+    reader.readAsDataURL(file)
+  }
+
+  const handleReset = () => {
+    stopLiveDetection()
+    setPreviewImage(null)
+    setDetectResult(null)
+    setErrorMessage("")
+    setImageNaturalSize({ width: 0, height: 0 })
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ""
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      <Navigation />
+
+      <section className="bg-gradient-to-br from-gray-50 to-white py-20">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="text-center">
+            <h1 className="text-5xl md:text-6xl font-serif font-black text-gray-900 mb-6">
+              Klasifikasi Sampah dan <span className="text-cyan-600">Estimasi Harga</span>
+            </h1>
+            <p className="text-xl text-gray-600 mb-8 max-w-3xl mx-auto font-sans">
+              Buka kamera untuk deteksi langsung atau unggah gambar. Setelah berhasil, kamu akan diarahkan ke halaman audit untuk melihat hasil lengkap.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section className="py-8 md:py-10">
+        <div className="mx-auto grid max-w-7xl grid-cols-1 gap-6 px-4 lg:grid-cols-12">
+          <aside className="space-y-4 lg:col-span-4 xl:col-span-3">
+            <Card className="border-slate-200 shadow-sm">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-lg font-serif font-bold text-slate-950">
+                  Mulai Deteksi
+                </CardTitle>
+              </CardHeader>
+
+              <CardContent className="space-y-3">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/jpeg,image/jpg,image/png"
+                  onChange={handleFileUpload}
+                  className="hidden"
+                />
+
+                {!isCameraOpen ? (
+                  <button
+                    onClick={handleOpenCamera}
+                    disabled={isLoading || isRedirecting}
+                    className="flex w-full items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:border-cyan-300 hover:bg-cyan-50 disabled:opacity-50"
+                  >
+                    <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-cyan-100 text-cyan-700">
+                      <Camera className="h-5 w-5" />
+                    </span>
+                    <span>
+                      <span className="block font-serif font-bold text-slate-950">
+                        Buka Kamera
+                      </span>
+                      <span className="block text-sm text-slate-500 font-sans">
+                        Live detection langsung aktif
+                      </span>
+                    </span>
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleCloseCamera}
+                    className="flex w-full items-center gap-4 rounded-2xl border border-red-200 bg-red-50 p-4 text-left transition hover:bg-red-100"
+                  >
+                    <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-red-100 text-red-700">
+                      <X className="h-5 w-5" />
+                    </span>
+                    <span>
+                      <span className="block font-serif font-bold text-red-800">
+                        Tutup Kamera
+                      </span>
+                      <span className="block text-sm text-red-600 font-sans">
+                        Menghentikan kamera dan live detection
+                      </span>
+                    </span>
+                  </button>
+                )}
+
+                {!isCameraOpen && (
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isLoading || isRedirecting}
+                    className="flex w-full items-center gap-4 rounded-2xl border border-slate-200 bg-white p-4 text-left shadow-sm transition hover:border-sky-300 hover:bg-sky-50 disabled:opacity-50"
+                  >
+                    <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-sky-100 text-sky-700">
+                      <Upload className="h-5 w-5" />
+                    </span>
+                    <span>
+                      <span className="block font-serif font-bold text-slate-950">
+                        Unggah Gambar
+                      </span>
+                      <span className="block text-sm text-slate-500 font-sans">
+                        JPG, JPEG, PNG maksimal 5MB
+                      </span>
+                    </span>
+                  </button>
+                )}
+
+                {(previewImage || detectResult) && !isCameraOpen && !isRedirecting && (
+                  <Button onClick={handleReset} variant="outline" className="w-full rounded-xl font-sans font-semibold">
+                    <RefreshCw className="mr-2 h-4 w-4" />
+                    Reset Hasil
+                  </Button>
+                )}
+              </CardContent>
+            </Card>
+
+            <Card className="border-slate-200 bg-white shadow-sm">
+              <CardContent className="p-5">
+                <div className="mb-2 flex items-center gap-2">
+                  <Tag className="h-5 w-5 text-amber-600" />
+                  <p className="font-serif font-bold text-slate-950">Data Harga Sampah</p>
+                </div>
+                <p className="text-sm leading-6 text-slate-600 font-sans">
+                  {isPriceLoading
+                    ? "Mengambil data harga..."
+                    : `${wasteTypes.length} jenis sampah tersedia untuk dicocokkan dengan hasil deteksi.`}
+                </p>
+              </CardContent>
+            </Card>
+
+            {errorMessage ? (
+              <Card className="border-red-200 bg-red-50 shadow-sm">
+                <CardContent className="p-5">
+                  <div className="flex items-start gap-3">
+                    <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-600" />
+                    <p className="text-sm font-sans font-semibold leading-6 text-red-800">
+                      {errorMessage}
+                    </p>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : null}
+          </aside>
+
+          <main className="space-y-6 lg:col-span-8 xl:col-span-9">
+            {isCameraOpen ? (
+              <Card className="overflow-hidden border-slate-200 bg-white shadow-sm">
+                <CardHeader className="border-b border-slate-200 bg-white">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <CardTitle className="text-xl font-serif font-bold text-slate-950">
+                        Kamera Live
+                      </CardTitle>
+                      <p className="mt-1 text-sm text-slate-500 font-sans">
+                        Arahkan kamera ke sampah. Deteksi berjalan otomatis.
+                      </p>
+                    </div>
+
+                    <Badge className="w-fit bg-cyan-50 text-cyan-700 hover:bg-cyan-50 font-sans">
+                      {isLiveDetecting ? "Live detection aktif" : "Menyiapkan kamera"}
+                    </Badge>
+                  </div>
+                </CardHeader>
+
+                <CardContent className="p-0">
+                  <div className="relative bg-slate-950" style={{ minHeight: "360px" }}>
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      onLoadedMetadata={() => {
+                        videoRef.current?.play().catch(console.error)
+                        startLiveDetection()
+                      }}
+                      className="block w-full"
+                      style={{
+                        maxHeight: "640px",
+                        objectFit: "contain",
+                        backgroundColor: "#020617",
+                      }}
+                    />
+
+                    {liveDetections.map((result, index) => {
+                      const videoWidth = videoRef.current?.videoWidth || 0
+                      const videoHeight = videoRef.current?.videoHeight || 0
+
+                      const hasValidBox =
+                        result.bbox.x2 > result.bbox.x1 &&
+                        result.bbox.y2 > result.bbox.y1 &&
+                        videoWidth > 0 &&
+                        videoHeight > 0
+
+                      if (!hasValidBox) return null
+
+                      const isNormalizedBox = result.bbox.x2 <= 1 && result.bbox.y2 <= 1
+
+                      const left = isNormalizedBox
+                        ? result.bbox.x1 * 100
+                        : (result.bbox.x1 / videoWidth) * 100
+
+                      const top = isNormalizedBox
+                        ? result.bbox.y1 * 100
+                        : (result.bbox.y1 / videoHeight) * 100
+
+                      const width = isNormalizedBox
+                        ? (result.bbox.x2 - result.bbox.x1) * 100
+                        : ((result.bbox.x2 - result.bbox.x1) / videoWidth) * 100
+
+                      const height = isNormalizedBox
+                        ? (result.bbox.y2 - result.bbox.y1) * 100
+                        : ((result.bbox.y2 - result.bbox.y1) / videoHeight) * 100
+
+                      return (
+                        <div
+                          key={`live-bbox-${result.label}-${index}`}
+                          className="pointer-events-none absolute rounded-lg border-2 border-cyan-400"
+                          style={{
+                            left: `${left}%`,
+                            top: `${top}%`,
+                            width: `${width}%`,
+                            height: `${height}%`,
+                          }}
+                        >
+                          <div className="absolute -top-8 left-0 whitespace-nowrap rounded-md bg-cyan-600 px-2 py-1 text-xs font-sans font-semibold text-white shadow-sm">
+                            {result.label} • {(result.confidence * 100).toFixed(1)}%
+                          </div>
+                        </div>
+                      )
+                    })}
+
+                    {isLiveProcessing ? (
+                      <div className="absolute right-3 top-3 flex items-center gap-2 rounded-full bg-white px-3 py-2 text-xs font-sans font-semibold text-slate-700 shadow-sm">
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        Memproses
+                      </div>
+                    ) : null}
+                  </div>
+
+                  {cameraError ? (
+                    <div className="border-t border-red-200 bg-red-50 p-4">
+                      <p className="text-sm text-red-800 font-sans">{cameraError}</p>
+                    </div>
+                  ) : null}
+
+                  <div className="border-t border-slate-200 bg-white p-4">
+                    <Button
+                      onClick={handleCapture}
+                      disabled={isLoading || isRedirecting}
+                      className="w-full rounded-xl bg-cyan-600 py-6 text-base font-sans font-bold text-white hover:bg-cyan-700 disabled:opacity-60"
+                    >
+                      <Circle className="mr-2 h-5 w-5" fill="currentColor" />
+                      Ambil Foto & Simpan Hasil
+                    </Button>
+                    <p className="mt-3 text-center text-xs text-slate-500 font-sans">
+                      Setelah foto diambil, hasil akan otomatis disimpan dan kamu diarahkan ke halaman audit.
+                    </p>
+                  </div>
+                </CardContent>
+              </Card>
+            ) : null}
+
+            {previewImage ? (
+              <Card className="overflow-hidden border-slate-200 bg-white shadow-sm">
+                <CardHeader className="border-b border-slate-200">
+                  <CardTitle className="text-xl font-serif font-bold text-slate-950">
+                    Preview Gambar
+                  </CardTitle>
+                </CardHeader>
+
+                <CardContent className="p-4">
+                  <div className="relative overflow-hidden rounded-2xl bg-slate-950">
+                    <img
+                      src={previewImage}
+                      alt="Preview"
+                      className="h-auto w-full"
+                      onLoad={(event) => {
+                        setImageNaturalSize({
+                          width: event.currentTarget.naturalWidth,
+                          height: event.currentTarget.naturalHeight,
+                        })
+                      }}
+                    />
+
+                    {!isLoading &&
+                      detections.map((result, index) => {
+                        const hasValidBox =
+                          result.bbox.x2 > result.bbox.x1 &&
+                          result.bbox.y2 > result.bbox.y1 &&
+                          imageNaturalSize.width > 0 &&
+                          imageNaturalSize.height > 0
+
+                        if (!hasValidBox) return null
+
+                        const isNormalizedBox = result.bbox.x2 <= 1 && result.bbox.y2 <= 1
+
+                        const left = isNormalizedBox
+                          ? result.bbox.x1 * 100
+                          : (result.bbox.x1 / imageNaturalSize.width) * 100
+
+                        const top = isNormalizedBox
+                          ? result.bbox.y1 * 100
+                          : (result.bbox.y1 / imageNaturalSize.height) * 100
+
+                        const width = isNormalizedBox
+                          ? (result.bbox.x2 - result.bbox.x1) * 100
+                          : ((result.bbox.x2 - result.bbox.x1) / imageNaturalSize.width) * 100
+
+                        const height = isNormalizedBox
+                          ? (result.bbox.y2 - result.bbox.y1) * 100
+                          : ((result.bbox.y2 - result.bbox.y1) / imageNaturalSize.height) * 100
+
+                        return (
+                          <div
+                            key={`bbox-${result.label}-${index}`}
+                            className="pointer-events-none absolute rounded-lg border-2 border-cyan-400"
+                            style={{
+                              left: `${left}%`,
+                              top: `${top}%`,
+                              width: `${width}%`,
+                              height: `${height}%`,
+                            }}
+                          >
+                            <div className="absolute -top-8 left-0 whitespace-nowrap rounded-md bg-cyan-600 px-2 py-1 text-xs font-sans font-semibold text-white shadow-sm">
+                              {result.label} • {(result.confidence * 100).toFixed(1)}%
+                            </div>
+                          </div>
+                        )
+                      })}
+
+                    {isLoading ? (
+                      <div className="absolute inset-0 flex items-center justify-center bg-slate-950/60">
+                        <div className="rounded-2xl bg-white px-5 py-4 text-center shadow-sm">
+                          <Loader2 className="mx-auto mb-3 h-7 w-7 animate-spin text-cyan-600" />
+                          <p className="text-sm font-sans font-semibold text-slate-800">Memproses deteksi...</p>
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {isRedirecting && !isLoading ? (
+                      <div className="absolute inset-0 flex items-center justify-center bg-slate-950/60">
+                        <div className="rounded-2xl bg-white px-5 py-4 text-center shadow-sm">
+                          <CheckCircle className="mx-auto mb-3 h-7 w-7 text-green-600" />
+                          <p className="text-sm font-sans font-semibold text-slate-800">
+                            Deteksi tersimpan. Mengarahkan ke audit...
+                          </p>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                </CardContent>
+              </Card>
+            ) : null}
+
+            {detectResult && !isLoading ? (
+              <Card className="border-slate-200 bg-white shadow-sm">
+                <CardHeader className="border-b border-slate-200">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <CardTitle className="text-xl font-serif font-bold text-slate-950">
+                      Ringkasan Deteksi
+                    </CardTitle>
+                    <Badge className="w-fit bg-green-50 text-green-700 hover:bg-green-50 font-sans">
+                      <CheckCircle className="mr-1 h-3.5 w-3.5" />
+                      Tersimpan
+                    </Badge>
+                  </div>
+                </CardHeader>
+
+                <CardContent className="space-y-6 p-5">
+                  <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                    <div className="rounded-2xl border border-slate-200 bg-cyan-50 p-4">
+                      <p className="text-sm text-slate-500 font-sans">Total Deteksi</p>
+                      <p className="mt-2 text-3xl font-serif font-black text-cyan-600">{detections.length}</p>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-amber-50 p-4">
+                      <p className="text-sm text-slate-500 font-sans">Prediksi Utama</p>
+                      <p className="mt-2 text-2xl font-serif font-black text-amber-600">{topPrediction}</p>
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-green-50 p-4">
+                      <p className="text-sm text-slate-500 font-sans">Estimasi Harga</p>
+                      <p className="mt-2 text-2xl font-serif font-black text-green-700">
+                        {formatCurrency(totalEstimatedPrice, "IDR")}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+                    <p className="text-sm text-slate-600 font-sans">
+                      Hasil lengkap deteksi ditampilkan di halaman audit. Detail bounding box, harga per item, dan informasi waktu deteksi tersedia di sana.
+                    </p>
+                  </div>
+
+                  <Button
+                    onClick={() => router.push("/audits")}
+                    disabled={isRedirecting}
+                    className="w-full rounded-xl bg-cyan-600 py-6 text-base font-sans font-bold text-white hover:bg-cyan-700 disabled:opacity-60"
+                  >
+                    {isRedirecting ? (
+                      <>
+                        <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                        Mengarahkan ke Audit...
+                      </>
+                    ) : (
+                      <>
+                        Lihat Detail di Halaman Audit
+                        <ArrowRight className="ml-2 h-5 w-5" />
+                      </>
+                    )}
+                  </Button>
+                </CardContent>
+              </Card>
+            ) : null}
+
+            {!previewImage && !isCameraOpen && !errorMessage ? (
+              <Card className="border-dashed border-slate-300 bg-white shadow-sm">
+                <CardContent className="px-6 py-14 text-center">
+                  <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-2xl bg-slate-100 text-slate-400">
+                    <Camera className="h-8 w-8" />
+                  </div>
+                  <p className="text-lg font-serif font-bold text-slate-800">
+                    Pilih kamera atau unggah gambar untuk memulai
+                  </p>
+                  <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-slate-500 font-sans">
+                    Setelah deteksi berhasil, hasil otomatis tersimpan dan kamu akan diarahkan ke halaman audit.
+                  </p>
+                </CardContent>
+              </Card>
+            ) : null}
+          </main>
+        </div>
+      </section>
+
+      {/* Tutorial Penggunaan */}
+      <section className="py-20 bg-gray-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="text-center mb-16">
+            <h2 className="text-4xl font-serif font-black text-gray-900 mb-4">
+              Cara Menggunakan Fitur Klasifikasi
+            </h2>
+            <p className="text-xl text-gray-600 max-w-3xl mx-auto font-sans">
+              Panduan sederhana untuk pengguna awam agar proses deteksi sampah bisa dilakukan dengan mudah.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
+            <Card className="border-0 shadow-lg hover:shadow-xl transition-shadow">
+              <CardHeader className="text-center pb-4">
+                <div className="w-16 h-16 bg-cyan-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                  <Camera className="h-8 w-8 text-cyan-600" />
+                </div>
+                <CardTitle className="text-xl font-serif font-bold">
+                  1. Buka Kamera
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="text-gray-600 font-sans text-center">
+                  Klik tombol buka kamera, lalu izinkan akses kamera dari browser. Setelah kamera terbuka, live detection akan berjalan otomatis.
+                </p>
+              </CardContent>
+            </Card>
+
+            <Card className="border-0 shadow-lg hover:shadow-xl transition-shadow">
+              <CardHeader className="text-center pb-4">
+                <div className="w-16 h-16 bg-amber-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                  <Circle className="h-8 w-8 text-amber-600" />
+                </div>
+                <CardTitle className="text-xl font-serif font-bold">
+                  2. Arahkan ke Sampah
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="text-gray-600 font-sans text-center">
+                  Arahkan kamera ke objek sampah dengan pencahayaan yang cukup. Sistem akan menampilkan kotak deteksi dan nama jenis sampah.
+                </p>
+              </CardContent>
+            </Card>
+
+            <Card className="border-0 shadow-lg hover:shadow-xl transition-shadow">
+              <CardHeader className="text-center pb-4">
+                <div className="w-16 h-16 bg-cyan-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                  <ArrowRight className="h-8 w-8 text-cyan-600" />
+                </div>
+                <CardTitle className="text-xl font-serif font-bold">
+                  3. Lihat di Halaman Audit
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <p className="text-gray-600 font-sans text-center">
+                  Tekan ambil foto atau unggah gambar. Hasil deteksi akan otomatis tersimpan dan kamu akan diarahkan ke halaman audit.
+                </p>
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="mt-12 bg-white rounded-lg shadow-lg p-8">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="flex items-start space-x-4">
+                <CheckCircle className="h-6 w-6 text-cyan-600 mt-1 flex-shrink-0" />
+                <div>
+                  <h3 className="text-lg font-serif font-bold text-gray-900 mb-2">
+                    Gunakan Pencahayaan yang Jelas
+                  </h3>
+                  <p className="text-gray-600 font-sans">
+                    Hasil deteksi akan lebih baik jika objek sampah terlihat jelas dan tidak terlalu gelap.
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-start space-x-4">
+                <CheckCircle className="h-6 w-6 text-cyan-600 mt-1 flex-shrink-0" />
+                <div>
+                  <h3 className="text-lg font-serif font-bold text-gray-900 mb-2">
+                    Satu Objek Lebih Mudah Dibaca
+                  </h3>
+                  <p className="text-gray-600 font-sans">
+                    Untuk pengguna baru, coba deteksi satu jenis sampah terlebih dahulu agar hasil lebih mudah dipahami.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* Footer */}
+      <footer className="bg-gray-900 text-white py-12 border-t border-gray-800">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-8 items-start">
+            <div className="md:col-span-2">
+              <h3 className="text-2xl font-serif font-black text-cyan-400 mb-3">
+                HargAI
+              </h3>
+              <p className="text-gray-400 font-sans text-sm leading-relaxed max-w-2xl">
+                HargAI adalah platform klasifikasi sampah berbasis AI yang membantu pengguna mengenali jenis sampah dan melihat estimasi harga secara cepat.
+              </p>
+            </div>
+
+            <div className="md:text-right">
+              <h4 className="text-lg font-serif font-bold mb-4">
+                Mulai Menggunakan
+              </h4>
+              <p className="text-gray-400 font-sans text-sm mb-4">
+                Daftar akun untuk mengakses fitur.
+              </p>
+              <Link href="/register">
+                <Button className="bg-cyan-600 hover:bg-cyan-700 text-white font-sans font-bold">
+                  Sign Up / Register
+                </Button>
+              </Link>
+            </div>
+          </div>
+
+          <div className="border-t border-gray-800 mt-8 pt-8 flex flex-col md:flex-row items-center justify-between gap-4">
+            <p className="text-gray-400 font-sans text-sm text-center md:text-left">
+              © 2026 HargAI. All rights reserved.
+            </p>
+            <p className="text-gray-500 font-sans text-xs text-center md:text-right">
+              Powered by HargAI Waste Classification System
+            </p>
+          </div>
+        </div>
+      </footer>
+
+      <canvas ref={canvasRef} className="hidden" />
+    </div>
+  )
+}

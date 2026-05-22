@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import { useState, useEffect, useRef } from "react"
-import { useRouter } from "next/navigation"
+import { useRouter, usePathname } from "next/navigation" // <-- tambahkan usePathname
 import { Menu, X, LogOut, User, ChevronDown } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { logout, isAuthenticated, getStoredUser } from "@/lib/auth"
@@ -14,12 +14,13 @@ type UserInfo = {
 }
 
 export default function Navigation() {
-  const [isMenuOpen, setIsMenuOpen]       = useState(false)
-  const [loggedIn, setLoggedIn]           = useState(false)
-  const [user, setUser]                   = useState<UserInfo | null>(null)
-  const [dropdownOpen, setDropdownOpen]   = useState(false)
-  const dropdownRef                       = useRef<HTMLDivElement>(null)
-  const router                            = useRouter()
+  const [isMenuOpen, setIsMenuOpen] = useState(false)
+  const [loggedIn, setLoggedIn] = useState(false)
+  const [user, setUser] = useState<UserInfo | null>(null)
+  const [dropdownOpen, setDropdownOpen] = useState(false)
+  const dropdownRef = useRef<HTMLDivElement>(null)
+  const router = useRouter()
+  const pathname = usePathname() // <-- gunakan ini untuk path saat ini
 
   useEffect(() => {
     const auth = isAuthenticated()
@@ -30,7 +31,6 @@ export default function Navigation() {
     }
   }, [])
 
-  // Tutup dropdown jika klik di luar
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
@@ -52,17 +52,23 @@ export default function Navigation() {
 
   const navLinks = [
     { href: "/profile", label: "Dashboard" },
-    { href: "/classify",  label: "Klasifikasi" },
-    { href: "/audits",    label: "Audit" },
-    { href: "/history",   label: "Riwayat" },
-    { href: "/reports",   label: "Laporan" },
+    { href: "/classify", label: "Klasifikasi" },
+    { href: "/audits", label: "Audit" },
+    { href: "/history", label: "Riwayat" },
+    { href: "/reports", label: "Laporan" },
   ]
 
   return (
     <nav className="bg-white border-b border-gray-200 sticky top-0 z-50">
+      <style>
+        {`
+          .glow-effect {
+            text-shadow: 0 0 8px rgba(0, 255, 255, 0.7);
+          }
+        `}
+      </style>
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex justify-between items-center h-16">
-
           {/* Logo */}
           <div className="flex items-center">
             <Link href="/" className="text-2xl font-serif font-black text-cyan-600">
@@ -72,18 +78,29 @@ export default function Navigation() {
             {/* Desktop nav links */}
             <div className="hidden md:block ml-10">
               <div className="flex items-baseline space-x-2">
-                {navLinks.map((item) => (
-                  <Link
-                    key={item.href}
-                    href={item.href}
-                    className="text-gray-600 hover:text-cyan-600 px-3 py-2 text-sm font-medium transition-colors"
-                  >
-                    {item.label}
-                  </Link>
-                ))}
+                {navLinks.map((item) => {
+                  const isActive = pathname === item.href // <-- pakai pathname
+                  return (
+                    <Link
+                      key={item.href}
+                      href={item.href}
+                      className={`px-3 py-2 text-sm font-medium transition-colors ${
+                        isActive
+                          ? "text-cyan-600 font-bold glow-effect"
+                          : "text-gray-600 hover:text-cyan-600"
+                      }`}
+                    >
+                      {item.label}
+                    </Link>
+                  )
+                })}
                 <Link
                   href="/about"
-                  className="text-gray-600 hover:text-cyan-600 px-3 py-2 text-sm font-medium transition-colors"
+                  className={`px-3 py-2 text-sm font-medium transition-colors ${
+                    pathname === "/about"
+                      ? "text-cyan-600 font-bold glow-effect"
+                      : "text-gray-600 hover:text-cyan-600"
+                  }`}
                 >
                   About
                 </Link>
@@ -95,16 +112,13 @@ export default function Navigation() {
           <div className="hidden md:flex items-center gap-3">
             {loggedIn && user ? (
               <div className="relative" ref={dropdownRef}>
-                {/* User trigger button */}
                 <button
                   onClick={() => setDropdownOpen((v) => !v)}
                   className="flex items-center gap-2.5 pl-2 pr-3 py-1.5 rounded-full border border-gray-200 hover:border-cyan-300 hover:bg-cyan-50 transition-all"
                 >
-                  {/* Avatar */}
                   <div className="w-8 h-8 rounded-full bg-cyan-100 flex items-center justify-center text-cyan-700 font-serif font-black text-sm flex-shrink-0">
                     {user.username?.[0]?.toUpperCase()}
                   </div>
-                  {/* Name + role */}
                   <div className="text-left leading-tight">
                     <p className="text-sm font-semibold text-gray-800 font-sans leading-none">
                       {user.username}
@@ -118,14 +132,11 @@ export default function Navigation() {
                   />
                 </button>
 
-                {/* Dropdown */}
                 {dropdownOpen && (
                   <div className="absolute right-0 mt-2 w-52 bg-white border border-gray-100 rounded-xl shadow-xl py-2 z-50">
-                    {/* User info header */}
                     <div className="px-4 py-2 border-b border-gray-100 mb-1">
                       <p className="text-xs text-gray-400 font-sans truncate">{user.email}</p>
                     </div>
-
                     <Link
                       href="/profile"
                       onClick={() => setDropdownOpen(false)}
@@ -134,7 +145,6 @@ export default function Navigation() {
                       <User className="h-4 w-4" />
                       Dashboard
                     </Link>
-
                     <div className="border-t border-gray-100 mt-1 pt-1">
                       <button
                         onClick={handleLogout}
@@ -171,7 +181,6 @@ export default function Navigation() {
         {/* Mobile menu */}
         {isMenuOpen && (
           <div className="md:hidden border-t border-gray-200">
-            {/* Mobile user info */}
             {loggedIn && user && (
               <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-100 bg-gray-50">
                 <div className="w-9 h-9 rounded-full bg-cyan-100 flex items-center justify-center text-cyan-700 font-serif font-black">
@@ -185,38 +194,47 @@ export default function Navigation() {
             )}
 
             <div className="px-2 pt-2 pb-3 space-y-1">
-              {navLinks.map((item) => (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  className="block px-3 py-2 text-base font-medium text-gray-600 hover:text-cyan-600 font-sans"
-                  onClick={() => setIsMenuOpen(false)}
-                >
-                  {item.label}
-                </Link>
-              ))}
+              {navLinks.map((item) => {
+                const isActive = pathname === item.href
+                return (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    onClick={() => setIsMenuOpen(false)}
+                    className={`block px-3 py-2 text-base font-medium font-sans transition-colors ${
+                      isActive
+                        ? "text-cyan-600 font-bold glow-effect"
+                        : "text-gray-600 hover:text-cyan-600"
+                    }`}
+                  >
+                    {item.label}
+                  </Link>
+                )
+              })}
               <Link
                 href="/about"
-                className="block px-3 py-2 text-base font-medium text-gray-600 hover:text-cyan-600 font-sans"
                 onClick={() => setIsMenuOpen(false)}
+                className={`block px-3 py-2 text-base font-medium font-sans transition-colors ${
+                  pathname === "/about"
+                    ? "text-cyan-600 font-bold glow-effect"
+                    : "text-gray-600 hover:text-cyan-600"
+                }`}
               >
                 About
               </Link>
 
               {loggedIn ? (
-                <>
-                  <button
-                    onClick={handleLogout}
-                    className="flex items-center gap-2 w-full text-left px-3 py-2 text-base font-medium text-red-600 hover:text-red-700 font-sans"
-                  >
-                    <LogOut className="h-4 w-4" /> Logout
-                  </button>
-                </>
+                <button
+                  onClick={handleLogout}
+                  className="flex items-center gap-2 w-full text-left px-3 py-2 text-base font-medium text-red-600 hover:text-red-700 font-sans"
+                >
+                  <LogOut className="h-4 w-4" /> Logout
+                </button>
               ) : (
                 <Link
                   href="/login"
-                  className="block px-3 py-2 text-base font-medium text-cyan-600 hover:text-cyan-700 font-sans"
                   onClick={() => setIsMenuOpen(false)}
+                  className="block px-3 py-2 text-base font-medium text-cyan-600 hover:text-cyan-700 font-sans"
                 >
                   Login
                 </Link>
